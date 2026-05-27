@@ -288,6 +288,7 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = _API_KEY_PROVIDER_AUX_MODELS_FALL
 _PROVIDER_VISION_MODELS: Dict[str, str] = {
     "xiaomi": "mimo-v2.5",
     "zai": "glm-5v-turbo",
+    "minimax-vlm": "MiniMax-M2.7",
 }
 
 # Providers whose endpoint does not accept image input, even though the
@@ -1098,6 +1099,192 @@ class AsyncAnthropicAuxiliaryClient:
         # See AsyncCodexAuxiliaryClient: mirror _real_client so cache
         # eviction on a poisoned underlying client also drops this entry.
         self._real_client = sync_wrapper._real_client
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MiniMax VLM auxiliary client
+# Endpoint: POST https://api.minimax.io/v1/coding_plan/vlm
+# Wire format: {"prompt": str, "image_url": "data:image/jpeg;base64,..."}
+# Response:    {"content": str, "base_resp": {"status_code": int, "status_msg": str}}
+# Auth: Bearer MINIMAX_CODING_PLAN_KEY (sk-cp-* prefix)
+# ─────────────────────────────────────────────────────────────────────────────
+
+VLM_URL = "https://api.minimax.io/v1/coding_plan/vlm"
+
+
+class _MiniMaxVLMCompletionsAdapter:
+    """Adapter that translates OpenAI-style chat.completions calls into MiniMax
+    VLM POST requests and translates the response back into an OpenAI
+    chat.completions-shaped result object.
+
+    Accepts ``messages`` with one user message that may contain an
+    ``image_url`` block (OpenAI format ``{"type": "image_url", "image_url":
+    {"url": "data:image/..."}}`` or compact ``"data:image/..."`` string).
+    Extracts the first image found and drops all others (MiniMax VLM is
+    single-image only). All text content is joined into the ``prompt``.
+    """
+
+    def __init__(self, api_key: str, model: str):
+        self._api_key = api_key
+        self._model = model
+
+    def create(self, **kwargs) -> Any:
+        import json
+        from urllib.error import HTTPError
+        import urllib.request
+        from types import SimpleNamespace
+
+        messages: list = kwargs.get("messages", [])
+        model: str = kwargs.get("model", self._model)
+
+        prompt_parts: list[str] = []
+        image_b64: str | None = None
+
+        for msg in messages:
+            # Handle both dict messages (Hermes format) and object messages (tests)
+            if isinstance(msg, dict):
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+            else:
+                role = getattr(msg, "role", "user")
+                content = getattr(msg, "content", "")
+            if isinstance(content, str):
+                if role == "system":
+                    prompt_parts.append(f"[System] {content}")
+                else:
+                    prompt_parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    # part is always a dict in practice (Hermes OpenAI format)
+                    if isinstance(part, dict):
+                        ptype = part.get("type", "text")
+                        if ptype == "text":
+                            text_val = part.get("text", "")
+                            if text_val:
+                                prompt_parts.append(str(text_val))
+                        elif ptype == "image_url" and image_b64 is None:
+                            raw_url = part.get("image_url", {})
+                            if isinstance(raw_url, dict):
+                                url = raw_url.get("url", "")
+                            else:
+                                url = str(raw_url) if raw_url else ""
+                            if url and url.startswith("data:") and "," in url:
+                                image_b64 = url[url.index(",") + 1:]
+                            elif url:
+                                image_b64 = url
+                    else:
+                        # Attribute-object fallback (e.g. SimpleNamespace)
+                        ptype = getattr(part, "type", "text")
+                        if ptype == "text":
+                            text_val = getattr(part, "text", "")
+                            if text_val:
+                                prompt_parts.append(str(text_val))
+                        elif ptype == "image_url" and image_b64 is None:
+                            raw_url = getattr(part, "image_url", None)
+                            if raw_url is not None:
+                                url = getattr(raw_url, "url", str(raw_url))
+                                if url and url.startswith("data:") and "," in url:
+                                    image_b64 = url[url.index(",") + 1:]
+                                elif url:
+                                    image_b64 = url
+
+        if image_b64 is None:
+            raise ValueError(
+                "MiniMax VLM requires at least one image in the message. "
+                "Add an image_url block to the user message."
+            )
+
+        prompt = " ".join(prompt_parts).strip() or "Describe this image in detail."
+        body = json.dumps({
+            "prompt": prompt,
+            "image_url": f"data:image/jpeg;base64,{image_b64}",
+        }).encode()
+
+        req = urllib.request.Request(
+            VLM_URL,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                result = json.loads(resp.read())
+        except HTTPError as e:
+            body_err = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"MiniMax VLM HTTP {e.code}: {e.reason}\n{body_err[:500]}"
+            ) from e
+
+        status_code = result.get("base_resp", {}).get("status_code", -1)
+        status_msg = result.get("base_resp", {}).get("status_msg", "unknown")
+        if status_code != 0:
+            raise RuntimeError(
+                f"MiniMax VLM returned status {status_code}: {status_msg}"
+            )
+
+        content_text = result.get("content", "")
+        message = SimpleNamespace(role="assistant", content=content_text)
+        choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
+        return SimpleNamespace(
+            choices=[choice],
+            model=model,
+            usage=SimpleNamespace(
+                prompt_tokens=0, completion_tokens=0, total_tokens=0
+            ),
+        )
+
+
+class _MiniMaxVLMChatShim:
+    def __init__(self, adapter: "_MiniMaxVLMCompletionsAdapter"):
+        self.completions = adapter
+
+
+class MiniMaxVLMAuxiliaryClient:
+    """OpenAI-client-compatible wrapper for the MiniMax VLM endpoint.
+
+    Consumers call ``client.chat.completions.create(messages=[...])`` as normal.
+    Internally translates the call into the MiniMax VLM ``{"prompt", "image_url"}``
+    wire format and translates the response back to an OpenAI-shaped result.
+    """
+
+    def __init__(self, api_key: str, model: str = "MiniMax-M2.7"):
+        self._api_key = api_key
+        self._model = model
+        adapter = _MiniMaxVLMCompletionsAdapter(api_key, model)
+        self.chat = _MiniMaxVLMChatShim(adapter)
+        self.api_key = api_key
+        self.base_url = VLM_URL
+
+    def close(self):
+        pass  # No persistent session to close
+
+
+class _AsyncMiniMaxVLMCompletionsAdapter:
+    def __init__(self, sync_adapter: "_MiniMaxVLMCompletionsAdapter"):
+        self._sync = sync_adapter
+
+    async def create(self, **kwargs) -> Any:
+        import asyncio
+        return await asyncio.to_thread(self._sync.create, **kwargs)
+
+
+class _AsyncMiniMaxVLMChatShim:
+    def __init__(self, adapter: "_AsyncMiniMaxVLMCompletionsAdapter"):
+        self.completions = adapter
+
+
+class AsyncMiniMaxVLMAuxiliaryClient:
+    """Async-compatible MiniMax VLM wrapper."""
+
+    def __init__(self, sync_wrapper: "MiniMaxVLMAuxiliaryClient"):
+        sync_adapter = sync_wrapper.chat.completions
+        async_adapter = _AsyncMiniMaxVLMCompletionsAdapter(sync_adapter)
+        self.chat = _AsyncMiniMaxVLMChatShim(async_adapter)
+        self.api_key = sync_wrapper.api_key
+        self.base_url = sync_wrapper.base_url
 
 
 def _endpoint_speaks_anthropic_messages(base_url: str) -> bool:
@@ -2072,6 +2259,18 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
         # when _anthropic_sdk is None.  Treat as unavailable.
         return None, None
     return AnthropicAuxiliaryClient(real_client, model, token, base_url, is_oauth=is_oauth), model
+
+
+def _try_minimax_vlm(
+    model: Optional[str] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
+    """Instantiate a MiniMaxVLMAuxiliaryClient if the API key is available."""
+    import os
+    api_key = os.getenv("MINIMAX_CODING_PLAN_KEY", "")
+    if not api_key:
+        return None, None
+    effective_model = model or "MiniMax-M2.7"
+    return MiniMaxVLMAuxiliaryClient(api_key, effective_model), effective_model
 
 
 _AUTO_PROVIDER_LABELS = {
@@ -3793,6 +3992,7 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
 _VISION_AUTO_PROVIDER_ORDER = (
     "openrouter",
     "nous",
+    "minimax-vlm",
 )
 
 
@@ -3849,6 +4049,8 @@ def _resolve_strict_vision_backend(
         return resolve_provider_client("openai-codex", model, is_vision=True)
     if provider == "anthropic":
         return _try_anthropic()
+    if provider == "minimax-vlm":
+        return _try_minimax_vlm(model=model)
     if provider == "custom":
         return _try_custom_endpoint()
     return None, None
