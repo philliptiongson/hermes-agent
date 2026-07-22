@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from agent.prompt_builder import build_vault_session_start_context
 from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
 
@@ -109,6 +110,75 @@ class TestContextFileCwd:
             context = build_system_prompt_parts(agent)["context"]
 
         assert "chosen workspace instructions" in context
+
+
+class TestVaultSessionStartContext:
+    def test_maps_all_four_profiles_and_lists_only_messages(self, tmp_path):
+        for profile, agent_name in {
+            "default": "Athena",
+            "amber": "Amber",
+            "judy": "Judy",
+            "holly": "Holly",
+        }.items():
+            agent_dir = tmp_path / f"Agent-{agent_name}"
+            inbox = agent_dir / "inbox"
+            inbox.mkdir(parents=True)
+            (agent_dir / "working-context.md").write_text(
+                f"current work for {agent_name}\n", encoding="utf-8"
+            )
+            (inbox / "README.md").write_text("instructions\n", encoding="utf-8")
+            message = inbox / f"2026-07-22-test-{profile}.md"
+            message.write_text("pending\n", encoding="utf-8")
+
+            result = build_vault_session_start_context(
+                profile, memory_root=tmp_path
+            )
+
+            assert f"Agent-{agent_name} working-context.md" in result
+            assert f"current work for {agent_name}" in result
+            assert str(message) in result
+            assert "README.md" not in result
+
+    def test_caps_working_context_at_120_lines(self, tmp_path):
+        agent_dir = tmp_path / "Agent-Athena"
+        (agent_dir / "inbox").mkdir(parents=True)
+        (agent_dir / "working-context.md").write_text(
+            "\n".join(f"line-{number}" for number in range(1, 126)) + "\n",
+            encoding="utf-8",
+        )
+
+        result = build_vault_session_start_context(
+            "default", memory_root=tmp_path
+        )
+
+        assert "line-120" in result
+        assert "line-121" not in result
+        assert "truncated at 120/125 lines" in result
+
+    def test_unknown_profile_gets_no_personal_context(self, tmp_path):
+        assert (
+            build_vault_session_start_context("unmapped", memory_root=tmp_path)
+            == ""
+        )
+
+    def test_precedes_caller_and_project_context(self):
+        agent = _make_agent()
+        with (
+            patch("agent.file_safety._resolve_active_profile_name", return_value="judy"),
+            patch(
+                "agent.system_prompt.build_vault_session_start_context",
+                return_value="VAULT SESSION CONTEXT",
+            ),
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value="PROJECT CONTEXT"),
+        ):
+            context = build_system_prompt_parts(
+                agent, system_message="CALLER CONTEXT"
+            )["context"]
+
+        assert context.index("VAULT SESSION CONTEXT") < context.index("CALLER CONTEXT")
+        assert context.index("CALLER CONTEXT") < context.index("PROJECT CONTEXT")
 
 
 def _stable_prompt(agent):
@@ -314,6 +384,10 @@ def test_build_system_prompt_records_stable_prefix():
         patch("run_agent.load_soul_md", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value="context"),
+        patch(
+            "agent.system_prompt.build_vault_session_start_context",
+            return_value="",
+        ),
     ):
         prompt = build_system_prompt(agent)
 
@@ -373,6 +447,10 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         ),
         patch("agent.file_safety._resolve_active_profile_name", return_value="default"),
         patch("hermes_time.now", return_value=datetime(2026, 1, 2)),
+        patch(
+            "agent.system_prompt.build_vault_session_start_context",
+            return_value="",
+        ),
     ):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 

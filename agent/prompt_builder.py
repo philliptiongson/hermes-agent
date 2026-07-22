@@ -46,6 +46,86 @@ from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
+
+# Phillip's shared cross-agent memory lives outside every Hermes profile
+# chroot.  Prompt assembly runs host-side, so this is the reliable point at
+# which to read it; a profile hook would resolve the absolute path from inside
+# the sandbox and silently miss the vault.
+_AGENT_MEMORY_ROOT = Path(
+    os.environ.get(
+        "HERMES_AGENT_MEMORY_ROOT",
+        "/Users/juniper/Documents/git-local/prt-memvault/agent-memory",
+    )
+)
+_HERMES_PROFILE_AGENT_NAMES = {
+    "default": "Athena",
+    "amber": "Amber",
+    "judy": "Judy",
+    "holly": "Holly",
+}
+
+
+def build_vault_session_start_context(
+    profile_name: str,
+    *,
+    memory_root: Optional[Path] = None,
+    max_working_context_lines: int = 120,
+) -> str:
+    """Return host-side working context and directed-inbox state for a profile.
+
+    Unknown profiles intentionally receive no personal vault context.  Read
+    failures are rendered into the prompt instead of breaking agent startup;
+    this makes a missing or inaccessible vault visible to the agent.
+    """
+    agent_name = _HERMES_PROFILE_AGENT_NAMES.get((profile_name or "").lower())
+    if not agent_name:
+        return ""
+
+    root = Path(memory_root) if memory_root is not None else _AGENT_MEMORY_ROOT
+    agent_dir = root / f"Agent-{agent_name}"
+    working_context_path = agent_dir / "working-context.md"
+    inbox_dir = agent_dir / "inbox"
+
+    sections = [
+        f"=== Agent-{agent_name} working-context.md "
+        "(auto-injected host-side at Hermes session start) ==="
+    ]
+    try:
+        all_lines = working_context_path.read_text(encoding="utf-8").splitlines()
+        sections.extend(all_lines[:max_working_context_lines])
+        if len(all_lines) > max_working_context_lines:
+            sections.append(
+                f"[... truncated at {max_working_context_lines}/{len(all_lines)} lines — "
+                f"read {working_context_path} for the remainder]"
+            )
+    except OSError as exc:
+        sections.append(f"UNAVAILABLE: {working_context_path} ({exc})")
+
+    sections.extend([
+        "",
+        f"=== Agent-{agent_name} inbox "
+        "(messages from peer agents — act on each, then move to _done/) ===",
+    ])
+    try:
+        messages = sorted(
+            path for path in inbox_dir.glob("*.md")
+            if path.is_file() and path.name.lower() != "readme.md"
+        )
+    except OSError:
+        messages = []
+    if messages:
+        sections.extend(f"- {path}" for path in messages)
+    else:
+        sections.append("(empty)")
+
+    sections.extend([
+        "",
+        "Reminder: Profile/about-phillip.md, Profile/style.md, and "
+        "Patterns/agent-memory-conventions.md are not injected; read them "
+        "before memory writes or when their context is needed.",
+    ])
+    return "\n".join(sections)
+
 # ---------------------------------------------------------------------------
 # Context file scanning — detect prompt injection / promptware in AGENTS.md,
 # .cursorrules, SOUL.md before they get injected into the system prompt.
