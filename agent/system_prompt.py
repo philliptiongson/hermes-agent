@@ -49,6 +49,7 @@ from agent.prompt_builder import (
     TELEGRAM_RICH_MESSAGES_HINT,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
+    build_vault_session_start_context,
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
@@ -770,6 +771,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # ── Context tier (cwd-dependent, may change between sessions) ─
     context_parts: List[str] = []
+
+    # Mechanical session-start context for Phillip's four Hermes profiles.
+    # This read must happen here, on the host, because profile chroots cannot
+    # resolve the shared vault's /Users/juniper/... path. Put it first so the
+    # current work and directed inbox are visible before caller/project text.
+    vault_session_context = build_vault_session_start_context(active_profile)
+    if vault_session_context:
+        context_parts.append(vault_session_context)
 
     if coding_workspace_parts:
         context_parts.extend(coding_workspace_parts)
