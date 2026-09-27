@@ -44,9 +44,17 @@ _AGENT_MEMORY_ROOT = Path(
 )
 _HERMES_PROFILE_AGENT_NAMES = {
     "default": "Athena",
+    "athena": "Athena",
     "amber": "Amber",
     "judy": "Judy",
     "holly": "Holly",
+    "hestia": "Holly",
+    "nyx": "Nyx",
+    "scotty": "Nyx",
+    "spock": "Artemis",
+    "artemis": "Artemis",
+    "juniper": "Juniper",
+    "codex": "Codex",
 }
 
 
