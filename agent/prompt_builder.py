@@ -1661,6 +1661,12 @@ def load_soul_md(context_length: Optional[int] = None, home_override: "Path | No
             # now injects the live section in Bot Chat only, so the copy is dead weight everywhere.
             from tools.bot_mode_probe import strip_legacy_protocol
             content = strip_legacy_protocol(content).strip()
+            # The same loader that strips YAML frontmatter from ``.hermes.md`` (#112570 trust class)
+            # is reused here: a SOUL.md symlinked at a vault-canonical document carries protocol
+            # metadata (``type: soul`` / ``agent-written: true`` / ``last_updated_by: juniper``) that
+            # has no business in identity slot #1 of a gateway prompt. The helper short-circuits when
+            # the file has no frontmatter, so a plain prose SOUL.md is unchanged.
+            content = _strip_yaml_frontmatter(content)
         if not content:
             return None
         # `hermes profile install <git-url>` / `profile update` plant a third-party SOUL.md into a
