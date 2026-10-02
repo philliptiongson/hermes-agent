@@ -57,7 +57,7 @@ export interface CatalogMeta {
 }
 
 // Docs section describing the PR-based submission workflow.
-export const SUBMIT_PLUGIN_URL = "/user-guide/features/plugin-catalog#submitting-a-plugin-to-the-catalog";
+export const SUBMIT_PLUGIN_URL = "/developer-guide/plugins/catalog-submission";
 
 /** Deep link into the Desktop app's Install Plugin dialog, catalog mode: the app
  *  resolves the reviewed pin itself, so the page never hands it a repo URL. */
@@ -116,6 +116,19 @@ export function categoryOf(plugin: Pick<CatalogPlugin, "category">) {
 
 export function tierOf(plugin: Pick<CatalogPlugin, "tier">) {
   return TIER_CONFIG[plugin.tier] || TIER_CONFIG.community;
+}
+
+/** Tool chips a catalog card shows: the first `max` names plus how many were folded into a `+N`. */
+export const CARD_TOOL_CHIP_LIMIT = 3;
+
+export interface CappedToolChips {
+  shown: string[];
+  hidden: number;
+}
+
+export function capToolChips(tools: string[] | undefined, max = CARD_TOOL_CHIP_LIMIT): CappedToolChips {
+  const all = tools ?? [];
+  return { shown: all.slice(0, max), hidden: Math.max(0, all.length - max) };
 }
 
 export function formatStars(n: number): string {
